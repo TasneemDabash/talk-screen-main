@@ -7,10 +7,12 @@ import {
   Send,
   Loader2,
   Trash2,
-  Languages,
-  Volume2,
-  VolumeX,
   AlertCircle,
+  Sparkles,
+  MessageCircle,
+  Mic,
+  MicOff,
+  Globe,
 } from "lucide-react";
 import { trpc } from "@/lib/trpc";
 import { Streamdown } from "streamdown";
@@ -28,38 +30,56 @@ type DisplayMediaStreamOptions = {
   selfBrowserSurface?: "exclude" | "include";
 };
 
-const SUPPORTED_LANGUAGES: Record<string, string> = {
-  en: "English",
-  ja: "Japanese",
-  es: "Spanish",
-  zh: "Chinese",
-  fr: "French",
-  it: "Italian",
-  ko: "Korean",
-  ar: "Arabic",
-  hi: "Hindi",
-  ru: "Russian",
-  id: "Indonesian",
-  pt: "Portuguese",
-};
+// Speech Recognition types
+interface SpeechRecognitionEvent extends Event {
+  results: SpeechRecognitionResultList;
+  resultIndex: number;
+}
 
-const SPEECH_LANGUAGE_CODES: Record<string, string> = {
-  en: "en-US",
-  ja: "ja-JP",
-  es: "es-ES",
-  zh: "zh-CN",
-  fr: "fr-FR",
-  it: "it-IT",
-  ko: "ko-KR",
-  ar: "ar-SA",
-  hi: "hi-IN",
-  ru: "ru-RU",
-  id: "id-ID",
-  pt: "pt-BR",
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+}
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition: new () => SpeechRecognition;
+    webkitSpeechRecognition: new () => SpeechRecognition;
+  }
+}
+
+// Supported languages for voice input
+const VOICE_LANGUAGES: Record<string, string> = {
+  "en-US": "English (US)",
+  "en-GB": "English (UK)",
+  "es-ES": "Spanish",
+  "fr-FR": "French",
+  "de-DE": "German",
+  "it-IT": "Italian",
+  "pt-BR": "Portuguese",
+  "ru-RU": "Russian",
+  "ja-JP": "Japanese",
+  "ko-KR": "Korean",
+  "zh-CN": "Chinese",
+  "ar-SA": "Arabic",
+  "hi-IN": "Hindi",
+  "nl-NL": "Dutch",
+  "pl-PL": "Polish",
+  "tr-TR": "Turkish",
 };
 
 export default function Chat() {
-  const [sessionId] = useState(() => `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
+  const [sessionId] = useState(() => `session_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`);
   const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([]);
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -67,25 +87,17 @@ export default function Chat() {
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
 
-  // Translation states
-  const [translationEnabled, setTranslationEnabled] = useState(false);
-  const [selectedLanguage, setSelectedLanguage] = useState("ja");
-  const [translations, setTranslations] = useState<Array<{ original: string; translated: string }>>([]);
-  const [isTranslating, setIsTranslating] = useState(false);
-
-  // Speech synthesis states
-  const [speechEnabled, setSpeechEnabled] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  // Voice input states
+  const [isListening, setIsListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
-  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voiceLanguage, setVoiceLanguage] = useState("en-US");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const translationsEndRef = useRef<HTMLDivElement>(null);
-  const speechSynthRef = useRef<SpeechSynthesis | null>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const videoPreviewRef = useRef<HTMLVideoElement>(null);
 
   // tRPC mutations and queries
   const sendMessageMutation = trpc.chat.sendMessage.useMutation();
-  const translateMutation = trpc.chat.translate.useMutation();
   const getHistoryQuery = trpc.chat.getHistory.useQuery({ sessionId });
 
   // Load chat history when component mounts
@@ -95,92 +107,79 @@ export default function Chat() {
     }
   }, [getHistoryQuery.data?.messages]);
 
-  // Initialize speech synthesis
-  useEffect(() => {
-    if ("speechSynthesis" in window) {
-      setSpeechSupported(true);
-      speechSynthRef.current = window.speechSynthesis;
-
-      const loadVoices = () => {
-        const voices = speechSynthRef.current?.getVoices() || [];
-        setAvailableVoices(voices);
-      };
-
-      loadVoices();
-      speechSynthRef.current.onvoiceschanged = loadVoices;
-
-      return () => {
-        if (speechSynthRef.current) {
-          speechSynthRef.current.cancel();
-        }
-      };
-    }
-  }, []);
-
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Update messages when new message is sent
+  // Update video preview when screen stream changes
   useEffect(() => {
-    if (sendMessageMutation.data?.response) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: sendMessageMutation.data.response },
-      ]);
+    if (videoPreviewRef.current && screenStream) {
+      videoPreviewRef.current.srcObject = screenStream;
     }
-  }, [sendMessageMutation.data?.response]);
+  }, [screenStream]);
 
+  // Initialize speech recognition
   useEffect(() => {
-    translationsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [translations]);
+    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognitionAPI) {
+      setSpeechSupported(true);
+      const recognition = new SpeechRecognitionAPI();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = voiceLanguage;
 
-  const speakText = (text: string, languageCode: string) => {
-    if (!speechSupported || !speechSynthRef.current || !text.trim()) {
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        let finalTranscript = "";
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          }
+        }
+
+        if (finalTranscript) {
+          setInputText((prev) => prev + finalTranscript);
+        }
+      };
+
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        if (event.error !== "no-speech") {
+          setLastError("Voice recognition error. Please try again.");
+        }
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
+  }, [voiceLanguage]);
+
+  const toggleVoiceInput = () => {
+    if (!speechSupported || !recognitionRef.current) {
+      setLastError("Voice input is not supported in your browser.");
       return;
     }
 
-    speechSynthRef.current.cancel();
-
-    const cleanText = text
-      .replace(/\*\*([^*]+)\*\*/g, "$1")
-      .replace(/\*([^*]+)\*/g, "$1")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/#{1,6}\s/g, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/\n+/g, " ")
-      .trim();
-
-    if (!cleanText) return;
-
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    const speechLangCode = SPEECH_LANGUAGE_CODES[languageCode] || "en-US";
-    utterance.lang = speechLangCode;
-
-    const preferredVoice = availableVoices.find((voice) => voice.lang.startsWith(speechLangCode.split("-")[0]));
-
-    if (preferredVoice) {
-      utterance.voice = preferredVoice;
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      setLastError(null);
+      recognitionRef.current.lang = voiceLanguage;
+      recognitionRef.current.start();
+      setIsListening(true);
     }
-
-    utterance.rate = 1.3;
-    utterance.pitch = 1.0;
-    utterance.volume = 0.8;
-
-    utterance.onstart = () => {
-      setIsSpeaking(true);
-    };
-
-    utterance.onend = () => {
-      setIsSpeaking(false);
-    };
-
-    utterance.onerror = () => {
-      setIsSpeaking(false);
-    };
-
-    speechSynthRef.current.speak(utterance);
   };
 
   const startScreenShare = async () => {
@@ -298,11 +297,6 @@ export default function Chat() {
       ]);
 
       setInputText("");
-
-      // Auto-translate if enabled
-      if (translationEnabled && response.response) {
-        handleTranslate(response.response);
-      }
     } catch (error) {
       setLastError("Failed to send message");
     } finally {
@@ -310,219 +304,217 @@ export default function Chat() {
     }
   };
 
-  const handleTranslate = async (textToTranslate: string) => {
-    if (!textToTranslate.trim()) {
-      return;
-    }
-
-    setIsTranslating(true);
-
-    try {
-      const response = await translateMutation.mutateAsync({
-        text: textToTranslate,
-        targetLanguage: selectedLanguage,
-        sessionId,
-      });
-
-      setTranslations((prev) => [
-        ...prev,
-        {
-          original: response.originalText,
-          translated: response.translatedText,
-        },
-      ]);
-
-      // Auto-speak if enabled
-      if (speechEnabled) {
-        speakText(response.translatedText, selectedLanguage);
-      }
-    } catch (error) {
-      setLastError("Failed to translate text");
-    } finally {
-      setIsTranslating(false);
-    }
-  };
-
-  const toggleSpeech = () => {
-    if (speechEnabled && isSpeaking) {
-      speechSynthRef.current?.cancel();
-      setIsSpeaking(false);
-    }
-    setSpeechEnabled(!speechEnabled);
-  };
-
   const clearContext = () => {
     setMessages([]);
-    setTranslations([]);
     setLastError(null);
-    if (speechSynthRef.current) {
-      speechSynthRef.current.cancel();
-      setIsSpeaking(false);
-    }
   };
 
+  // Chat Panel Component (reusable for both layouts)
+  const ChatPanel = ({ compact = false }: { compact?: boolean }) => (
+    <Card className={`shadow-xl border-0 bg-white/70 backdrop-blur-sm rounded-2xl overflow-hidden ${compact ? 'h-full flex flex-col' : ''}`}>
+      <CardHeader className="border-b border-purple-100 bg-gradient-to-r from-purple-500 to-pink-500 text-white py-3">
+        <CardTitle className="flex items-center gap-2 m-0 text-base">
+          <MessageCircle className="w-4 h-4" />
+          Chat
+        </CardTitle>
+      </CardHeader>
+      <CardContent className={`p-0 ${compact ? 'flex-1 flex flex-col' : ''}`}>
+        {/* Messages Area */}
+        <div className={`overflow-y-auto p-3 space-y-3 bg-gradient-to-b from-white/50 to-purple-50/30 ${compact ? 'flex-1' : 'h-[350px]'}`}>
+          {messages.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full text-gray-400">
+              <MessageCircle className="w-8 h-8 mb-2 opacity-50" />
+              <p className="text-xs">No messages yet</p>
+            </div>
+          )}
+          {messages.map((msg, idx) => (
+            <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div
+                className={`max-w-[90%] px-3 py-2 rounded-xl text-sm shadow-sm ${
+                  msg.role === "user"
+                    ? "bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-br-sm"
+                    : "bg-white text-gray-800 border border-purple-100 rounded-bl-sm"
+                }`}
+              >
+                <Streamdown>{msg.content}</Streamdown>
+              </div>
+            </div>
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Input Area */}
+        <div className="p-3 bg-white border-t border-purple-100 space-y-3">
+          {lastError && (
+            <div className="flex items-center gap-2 p-2 bg-red-50 text-red-600 rounded-lg border border-red-200">
+              <AlertCircle className="w-3 h-3 flex-shrink-0" />
+              <span className="text-xs">{lastError}</span>
+            </div>
+          )}
+
+          {/* Language Selector */}
+          <div className="flex items-center gap-2">
+            <Globe className="w-4 h-4 text-purple-500" />
+            <select
+              value={voiceLanguage}
+              onChange={(e) => setVoiceLanguage(e.target.value)}
+              className="flex-1 text-xs p-2 border border-purple-200 rounded-lg bg-purple-50/50 focus:outline-none focus:ring-2 focus:ring-purple-300"
+            >
+              {Object.entries(VOICE_LANGUAGES).map(([code, name]) => (
+                <option key={code} value={code}>{name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Message Input */}
+          <textarea
+            value={inputText}
+            onChange={(e) => setInputText(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e as any).nativeEvent?.isComposing) {
+                return;
+              }
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSendMessage();
+              }
+            }}
+            placeholder="Type or speak your message..."
+            className="w-full p-3 border border-purple-200 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-purple-300 focus:border-transparent bg-purple-50/50 placeholder-gray-400 transition-all text-sm"
+            rows={2}
+          />
+
+          {/* Action Buttons */}
+          <div className="flex gap-2">
+            <Button
+              onClick={handleSendMessage}
+              disabled={isLoading || !inputText.trim()}
+              className="flex-1 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-xl shadow-lg shadow-purple-500/25 text-sm"
+            >
+              {isLoading ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Send className="w-4 h-4 mr-1" />}
+              Send
+            </Button>
+
+            <Button
+              onClick={toggleVoiceInput}
+              disabled={!speechSupported}
+              className={`rounded-xl transition-all ${
+                isListening
+                  ? "bg-gradient-to-r from-red-500 to-orange-500 hover:from-red-600 hover:to-orange-600 text-white shadow-lg shadow-red-500/25 animate-pulse"
+                  : "bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white shadow-lg shadow-emerald-500/25"
+              }`}
+              title={isListening ? "Stop listening" : "Start voice input"}
+            >
+              {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+            </Button>
+
+            <Button
+              onClick={clearContext}
+              variant="outline"
+              className="border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700 rounded-xl"
+            >
+              <Trash2 className="w-4 h-4" />
+            </Button>
+          </div>
+
+          {isListening && (
+            <div className="p-2 bg-gradient-to-r from-red-50 to-orange-50 text-red-600 rounded-lg border border-red-200 text-xs flex items-center gap-2">
+              <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+              Listening in {VOICE_LANGUAGES[voiceLanguage]}...
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  // Screen Sharing Layout (screen as main, chat as sidebar)
+  if (isScreenSharing) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 p-4">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 bg-white/80 backdrop-blur-sm px-3 py-1.5 rounded-full shadow-sm">
+              <Sparkles className="w-4 h-4 text-purple-500" />
+              <span className="text-sm font-medium text-purple-700">Talk Screen AI</span>
+            </div>
+          </div>
+          <Button
+            onClick={stopScreenShare}
+            className="bg-gradient-to-r from-red-500 to-orange-500 hover:from-red-600 hover:to-orange-600 text-white rounded-xl shadow-lg"
+          >
+            <MonitorOff className="w-4 h-4 mr-2" />
+            Stop Sharing
+          </Button>
+        </div>
+
+        {/* Main Content - Screen + Chat Sidebar */}
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 h-[calc(100vh-120px)]">
+          {/* Screen Preview - Main Area */}
+          <div className="lg:col-span-3">
+            <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-400 shadow-2xl h-full bg-gray-900">
+              <video
+                ref={videoPreviewRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-contain"
+              />
+              {/* Live indicator */}
+              <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/70 backdrop-blur-sm px-4 py-2 rounded-full">
+                <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+                <span className="text-white text-sm font-medium">LIVE</span>
+              </div>
+              {/* Screen info */}
+              <div className="absolute bottom-4 left-4 bg-black/70 backdrop-blur-sm px-4 py-2 rounded-lg">
+                <p className="text-white text-sm">Screen will be captured when you send a message</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Chat Sidebar */}
+          <div className="lg:col-span-1 h-full">
+            <ChatPanel compact />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Default Layout (no screen sharing)
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
-      <div className="w-full">
-        <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-          {/* Main Chat Area - Expanded */}
-          <div className="lg:col-span-3 space-y-4">
-            <Card className="h-[600px] flex flex-col">
-              <CardHeader className="border-b">
-                <CardTitle>Talk Screen AI</CardTitle>
-              </CardHeader>
-              <CardContent className="flex-1 overflow-y-auto p-4 space-y-4">
-                {messages.map((msg, idx) => (
-                  <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                    <div
-                      className={`max-w-lg px-4 py-2 rounded-lg ${
-                        msg.role === "user" ? "bg-blue-500 text-white" : "bg-gray-200 text-gray-900"
-                      }`}
-                    >
-                      <Streamdown>{msg.content}</Streamdown>
-                    </div>
-                  </div>
-                ))}
-                <div ref={messagesEndRef} />
-              </CardContent>
-            </Card>
-
-            {/* Input Area */}
-            <Card>
-              <CardContent className="p-4 space-y-4">
-                {lastError && (
-                  <div className="flex items-center gap-2 p-3 bg-red-100 text-red-700 rounded-lg">
-                    <AlertCircle className="w-4 h-4" />
-                    <span>{lastError}</span>
-                  </div>
-                )}
-
-                <div className="flex gap-2">
-                  {!isScreenSharing ? (
-                    <Button onClick={startScreenShare} variant="outline" className="flex-1">
-                      <Monitor className="w-4 h-4 mr-2" />
-                      Start Screen Share
-                    </Button>
-                  ) : (
-                    <Button onClick={stopScreenShare} variant="destructive" className="flex-1">
-                      <MonitorOff className="w-4 h-4 mr-2" />
-                      Stop Screen Share
-                    </Button>
-                  )}
-                </div>
-
-                {isScreenSharing && (
-                  <div className="p-3 bg-green-100 text-green-700 rounded-lg text-sm">
-                    ✓ Screen sharing active. Your screen will be captured when you send a message.
-                  </div>
-                )}
-
-                <textarea
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  onKeyDown={(e) => {
-                    // Check if IME composition is in progress
-                    if ((e as any).nativeEvent?.isComposing) {
-                      return;
-                    }
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSendMessage();
-                    }
-                  }}
-                  onCompositionStart={() => {
-                    // Mark IME composition as active
-                  }}
-                  onCompositionEnd={() => {
-                    // IME composition ended
-                  }}
-                  placeholder="Type your message... (Press Enter to send, Shift+Enter for new line)"
-                  className="w-full p-3 border rounded-lg resize-none"
-                  rows={3}
-                />
-
-                <Button onClick={handleSendMessage} disabled={isLoading || !inputText.trim()} className="w-full">
-                  {isLoading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Send className="w-4 h-4 mr-2" />}
-                  Send
-                </Button>
-
-                <Button onClick={clearContext} variant="outline" className="w-full">
-                  <Trash2 className="w-4 h-4 mr-2" />
-                  Clear Context
-                </Button>
-              </CardContent>
-            </Card>
+    <div className="min-h-screen bg-gradient-to-br from-violet-50 via-purple-50 to-fuchsia-50 p-4 md:p-6">
+      <div className="max-w-4xl mx-auto">
+        {/* Header */}
+        <div className="text-center mb-6">
+          <div className="inline-flex items-center gap-2 bg-white/80 backdrop-blur-sm px-4 py-2 rounded-full shadow-sm mb-4">
+            <Sparkles className="w-5 h-5 text-purple-500" />
+            <span className="text-sm font-medium text-purple-700">AI-Powered Assistant</span>
           </div>
+          <h1 className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-purple-600 via-pink-500 to-orange-400 bg-clip-text text-transparent">
+            Talk Screen AI
+          </h1>
+          <p className="text-gray-500 mt-2">Share your screen and chat with AI</p>
+        </div>
 
-          {/* Translation Panel */}
-          <div className="lg:col-span-2 space-y-4">
-            <Card>
-              <CardHeader className="border-b">
-                <CardTitle className="flex items-center gap-2">
-                  <Languages className="w-4 h-4" />
-                  Translation
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="p-4 space-y-4">
-                <div className="flex gap-2">
-                  <input
-                    type="checkbox"
-                    id="translation-toggle"
-                    checked={translationEnabled}
-                    onChange={(e) => setTranslationEnabled(e.target.checked)}
-                    className="w-4 h-4"
-                  />
-                  <label htmlFor="translation-toggle" className="text-sm">
-                    Enable Translation
-                  </label>
-                </div>
+        {/* Start Screen Share Button */}
+        <div className="mb-6">
+          <Button
+            onClick={startScreenShare}
+            className="w-full bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-xl shadow-lg shadow-purple-500/25 py-6 text-lg"
+          >
+            <Monitor className="w-5 h-5 mr-2" />
+            Start Screen Share
+          </Button>
+        </div>
 
-                {translationEnabled && (
-                  <>
-                    <select
-                      value={selectedLanguage}
-                      onChange={(e) => setSelectedLanguage(e.target.value)}
-                      className="w-full p-2 border rounded-lg text-sm"
-                    >
-                      {Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => (
-                        <option key={code} value={code}>
-                          {name}
-                        </option>
-                      ))}
-                    </select>
+        {/* Chat Card */}
+        <ChatPanel />
 
-                    <div className="flex gap-2">
-                      <input
-                        type="checkbox"
-                        id="speech-toggle"
-                        checked={speechEnabled}
-                        onChange={toggleSpeech}
-                        disabled={!speechSupported}
-                        className="w-4 h-4"
-                      />
-                      <label htmlFor="speech-toggle" className="text-sm flex items-center gap-2">
-                        {isSpeaking ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
-                        Text-to-Speech
-                      </label>
-                    </div>
-                  </>
-                )}
-
-                <div className="h-[500px] overflow-y-auto border rounded-lg p-3 bg-gray-50 space-y-2">
-                  {translations.length === 0 ? (
-                    <p className="text-sm text-gray-500">No translations yet</p>
-                  ) : (
-                    translations.map((trans, idx) => (
-                      <div key={idx} className="p-3 bg-white rounded border border-indigo-200">
-                        <Streamdown>{trans.translated}</Streamdown>
-                      </div>
-                    ))
-                  )}
-                  <div ref={translationsEndRef} />
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+        {/* Footer */}
+        <div className="text-center mt-6 text-sm text-gray-400">
+          Powered by AI Support Team
         </div>
       </div>
     </div>
